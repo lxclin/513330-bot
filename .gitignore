@@ -1,0 +1,36 @@
+# Python 虚拟环境
+__pycache__/
+*.pyc
+
+# trader-master CTP 交易框架（独立项目，不相关）
+trader-master/
+
+# 大文件 / 压缩包
+trader-master.zip
+
+# 旧的回测文件（与日报无关）
+backtest_true_qt.py
+backtest_enhanced.py
+Dual_Moving_Average_Crossover_*
+macd_恒生科技
+
+# 本地配置（含密钥）
+push_config.txt
+
+# Windows 本地脚本
+run_true_qt.ps1
+
+# VSCode / 系统
+.vscode/
+Thumbs.db
+.DS_Store
+
+# Claude 配置
+.claude/
+CLAUDE.md
+
+# 日志（每日增长）
+true_qt_log.txt
+
+# 备份
+true_qt.backup

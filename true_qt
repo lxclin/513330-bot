@@ -1,0 +1,481 @@
+"""
+513330 量化监控 — 增强版
+- 跨波谷背离验证（不止看最近两个波谷）
+- 量能萎缩确认（卖压衰竭）
+- 信号去重（一次背离不重复触发）
+- 持仓救援模式：DCA 摊薄成本计算
+- 多周期 RSI 确认
+"""
+
+import akshare as ak
+import pandas as pd
+import numpy as np
+import json, os, sys
+from datetime import datetime
+from io import StringIO
+
+# ==================== 配置 ====================
+SYMBOL = "513330"
+SWING_WINDOW = 5
+RSI_PERIOD = 14
+RSI_OVERSOLD = 30
+RSI_WEEKLY_PERIOD = 14
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+STATE_FILE = os.path.join(SCRIPT_DIR, "true_qt_state.json")
+
+# ==================== 仓位配置（从 state 读取） ====================
+state = {}
+try:
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, 'r') as f:
+            state = json.load(f)
+except Exception:
+    pass
+
+cost_basis = state.get("cost_basis", None)
+total_shares = state.get("total_shares", 0)
+total_cost = state.get("total_cost", 0.0)
+
+# ==================== 数据获取 ====================
+df = ak.fund_etf_hist_sina(symbol=f"sh{SYMBOL}")
+df['date'] = pd.to_datetime(df['date'])
+df = df.sort_values('date').reset_index(drop=True)
+
+last_idx = len(df) - 1
+today_date = df.loc[last_idx, 'date'].strftime("%Y-%m-%d")
+price_current = df.loc[last_idx, 'close']
+price_change = df['close'].pct_change().iloc[-1] * 100
+
+# ==================== 指标计算 ====================
+# MACD
+ema12 = df['close'].ewm(span=12, adjust=False).mean()
+ema26 = df['close'].ewm(span=26, adjust=False).mean()
+df['DIF'] = ema12 - ema26
+df['DEA'] = df['DIF'].ewm(span=9, adjust=False).mean()
+df['MACD'] = 2 * (df['DIF'] - df['DEA'])
+
+# RSI14
+delta = df['close'].diff()
+gain = delta.where(delta > 0, 0.0).rolling(window=RSI_PERIOD).mean()
+loss = (-delta.where(delta < 0, 0.0)).rolling(window=RSI_PERIOD).mean()
+rs = gain / loss
+df['RSI14'] = 100 - (100 / (1 + rs))
+rsi_current = df['RSI14'].iloc[-1]
+
+# 周线 RSI（用 5 日近似）
+df['RSI_weekly'] = df['close'].diff()
+gain_w = df['RSI_weekly'].where(df['RSI_weekly'] > 0, 0.0).rolling(window=RSI_WEEKLY_PERIOD * 5).mean()
+loss_w = (-df['RSI_weekly'].where(df['RSI_weekly'] < 0, 0.0)).rolling(window=RSI_WEEKLY_PERIOD * 5).mean()
+rs_w = gain_w / loss_w
+df['RSI_weekly'] = 100 - (100 / (1 + rs_w))
+
+# MA20
+df['MA20'] = df['close'].rolling(window=20).mean()
+
+price_high = df['close'].max()
+price_low = df['close'].min()
+drop_pct = abs((price_current - price_high) / price_high * 100)
+
+# ==================== 波谷检测 ====================
+close_vals = df['close'].values
+dif_vals = df['DIF'].values
+vol_vals = df['volume'].values
+
+raw_lows = []
+for i in range(SWING_WINDOW, len(close_vals) - SWING_WINDOW):
+    if close_vals[i] == min(close_vals[i - SWING_WINDOW : i + SWING_WINDOW + 1]):
+        raw_lows.append(i)
+
+confirmed_lows = []
+for idx in raw_lows:
+    if confirmed_lows:
+        gap = idx - confirmed_lows[-1]
+        if gap <= 3:
+            if close_vals[idx] <= close_vals[confirmed_lows[-1]]:
+                confirmed_lows[-1] = idx
+            continue
+    confirmed_lows.append(idx)
+
+# ==================== MACD 底背离分析（增强） ====================
+macd_divergence = False
+macd_potential = False
+macd_strength = 0        # 0-10 综合评分
+macd_lines = []
+trough_checks = []        # 跨波谷检查记录
+
+if len(confirmed_lows) >= 2:
+    prev = confirmed_lows[-2]
+    last = confirmed_lows[-1]
+    prev_c = df.loc[prev, 'close']
+    prev_d = df.loc[prev, 'DIF']
+    prev_dt = df.loc[prev, 'date'].strftime("%m-%d")
+    last_c = df.loc[last, 'close']
+    last_d = df.loc[last, 'DIF']
+    last_dt = df.loc[last, 'date'].strftime("%m-%d")
+
+    price_lower = last_c < prev_c
+    dif_higher = last_d > prev_d
+    macd_divergence = price_lower and dif_higher
+
+    pa = "↓" if last_c < prev_c else ("↑" if last_c > prev_c else "=")
+    da = "↑" if last_d > prev_d else ("↓" if last_d < prev_d else "=")
+    macd_lines.append(
+        f"最近波谷: {prev_dt}({prev_c:.3f}/DIF{prev_d:.4f}) → {last_dt}({last_c:.3f}/DIF{last_d:.4f}) "
+        f"价格{pa} DIF{da}"
+    )
+
+    # ---- 跨波谷验证：检查所有历史波谷的 DIF 趋势 ----
+    if len(confirmed_lows) >= 3:
+        cross_ok = 0
+        cross_total = 0
+        for t_idx in range(len(confirmed_lows) - 2, -1, -1):
+            t = confirmed_lows[t_idx]
+            t_c = close_vals[t]
+            t_d = dif_vals[t]
+            if t_c > last_c:  # 该历史波谷价格比当前高
+                cross_total += 1
+                if t_d < last_d:  # 但 DIF 比当前低 → 背离强化
+                    cross_ok += 1
+        if cross_total > 0:
+            ratio = cross_ok / cross_total
+            macd_lines.append(f"跨波谷验证: {cross_ok}/{cross_total} 历史波谷 DIF 低于当前 "
+                              f"({'✓ 强背离' if ratio >= 0.6 else '△ 弱背离' if ratio >= 0.3 else '✗ 背离不可靠'})")
+            trough_checks = [cross_ok, cross_total, ratio]
+            if macd_divergence:
+                macd_strength += int(ratio * 4)
+
+    # 潜在背离检测
+    since_last = df.iloc[last:]
+    low_i = since_last['close'].idxmin()
+    low_c = since_last.loc[low_i, 'close']
+    low_d = since_last.loc[low_i, 'DIF']
+    low_dt = since_last.loc[low_i, 'date'].strftime("%m-%d")
+
+    if not macd_divergence:
+        if low_c < last_c and low_d > last_d:
+            macd_potential = True
+            macd_lines.append(
+                f"潜在背离: {low_dt} 创阶段新低 {low_c:.3f}, "
+                f"DIF({low_d:.4f}) > {last_dt}波谷DIF({last_d:.4f}), 等待波谷 5 日确认"
+            )
+        elif low_c < last_c:
+            macd_lines.append(
+                f"暂无背离: {low_dt} 创新低 {low_c:.3f}, DIF({low_d:.4f}) 同步走低 ↓"
+            )
+        else:
+            days = len(df) - last - 1
+            macd_lines.append(f"暂无背离: 距上一波谷 {days} 日, 价格未创新低")
+
+elif len(confirmed_lows) == 1:
+    last = confirmed_lows[-1]
+    last_c = df.loc[last, 'close']
+    last_d = df.loc[last, 'DIF']
+    last_dt = df.loc[last, 'date'].strftime("%m-%d")
+    macd_lines.append(f"仅1个确认波谷 ({last_dt}), 需等待第二个波谷形成")
+
+    since_last = df.iloc[last:]
+    low_i = since_last['close'].idxmin()
+    low_c = since_last.loc[low_i, 'close']
+    low_d = since_last.loc[low_i, 'DIF']
+    low_dt = since_last.loc[low_i, 'date'].strftime("%m-%d")
+
+    if low_c < last_c and low_d > last_d:
+        macd_potential = True
+        macd_lines.append(
+            f"潜在背离: {low_dt} 创阶段新低 {low_c:.3f}, DIF({low_d:.4f}) > {last_dt}({last_d:.4f}), 等待波谷 5 日确认"
+        )
+    elif low_c < last_c:
+        macd_lines.append(f"暂无背离: {low_dt} 创新低 {low_c:.3f}, DIF({low_d:.4f}) 同步走低 ↓")
+else:
+    macd_lines.append("数据不足,无确认波谷")
+
+macd_text = "\n    ".join(macd_lines)
+
+# ==================== RSI 超卖金叉分析 ====================
+rsi_golden = False
+search_start = confirmed_lows[-1] if confirmed_lows else max(0, last_idx - 30)
+for i in range(search_start, last_idx + 1):
+    if i > 0:
+        if df.loc[i - 1, 'RSI14'] <= RSI_OVERSOLD and df.loc[i, 'RSI14'] > RSI_OVERSOLD:
+            rsi_golden = True
+            break
+
+rsi_oversold_now = rsi_current < RSI_OVERSOLD
+recent_rsi_oversold = (df['RSI14'].tail(30) < RSI_OVERSOLD).any()
+
+rsi_weekly = df['RSI_weekly'].iloc[-1]
+weekly_oversold = rsi_weekly < RSI_OVERSOLD if not np.isnan(rsi_weekly) else None
+
+if rsi_golden:
+    rsi_text = f"RSI14 已金叉 (上穿{RSI_OVERSOLD}线, 当前 {rsi_current:.1f})"
+elif rsi_oversold_now:
+    rsi_text = f"RSI14={rsi_current:.1f} 处于超卖区 (<{RSI_OVERSOLD}), 等待上穿金叉"
+elif recent_rsi_oversold:
+    rsi_text = f"RSI14={rsi_current:.1f} 已脱离超卖区, 但未形成确认金叉"
+else:
+    rsi_text = f"RSI14={rsi_current:.1f}, 近 30 日未触及超卖区"
+
+# ==================== 量价分析（增强） ====================
+recent_vol = df['volume'].tail(3).mean()
+vol_base = df['volume'].tail(20).mean()
+vol_ratio = recent_vol / vol_base if vol_base > 0 else 1.0
+
+# 量能萎缩加分：新低日成交量萎缩=卖压衰竭
+vol_exhaustion = False
+if macd_potential:
+    lowest_idx = df.iloc[confirmed_lows[-1]:]['close'].idxmin() if confirmed_lows else last_idx
+    low_day_vol = df.loc[lowest_idx, 'volume']
+    low_day_vol_ratio = low_day_vol / vol_base if vol_base > 0 else 1.0
+    if low_day_vol_ratio < 0.7:
+        vol_exhaustion = True
+
+if vol_ratio < 0.5:
+    vol_text = f"极度缩量 {vol_ratio:.0%} (均量 {vol_base / 1e8:.1f}亿), 卖压大幅萎缩"
+    vol_score = 2
+elif vol_ratio < 0.7:
+    vol_text = f"缩量 {vol_ratio:.0%} (均量 {vol_base / 1e8:.1f}亿), 卖压有所萎缩"
+    vol_score = 1
+elif vol_ratio > 1.5:
+    vol_text = f"急剧放量 {vol_ratio:.0%} (均量 {vol_base / 1e8:.1f}亿), 恐慌盘涌出 ⚠️"
+    vol_score = -1
+elif vol_ratio > 1.3:
+    vol_text = f"放量 {vol_ratio:.0%} (均量 {vol_base / 1e8:.1f}亿), 多空博弈激烈"
+    vol_score = 0
+else:
+    vol_text = f"量能正常 {vol_ratio:.0%} (均量 {vol_base / 1e8:.1f}亿)"
+    vol_score = 0
+
+if vol_exhaustion:
+    vol_text += " | 新低日缩量 ← 卖压衰竭信号"
+    macd_strength += 2
+
+# ==================== 信号等级（增强） ====================
+# 信号去重：同一波谷对只触发一次 ALERT
+last_alert_date = state.get("last_alert_date", "")
+last_divergence_low_idx = state.get("last_divergence_low_idx", -1)
+
+current_low_idx = confirmed_lows[-1] if confirmed_lows else -1
+already_alerted = (current_low_idx == last_divergence_low_idx and last_divergence_low_idx >= 0)
+
+# 综合评分
+if macd_divergence:
+    macd_strength += 4
+    if len(confirmed_lows) >= 3 and trough_checks and trough_checks[2] >= 0.6:
+        macd_strength += 1
+
+if macd_potential:
+    macd_strength += 2
+
+if rsi_golden:
+    macd_strength += 2
+if rsi_oversold_now:
+    macd_strength += 1
+if vol_score > 0:
+    macd_strength += vol_score
+if weekly_oversold is not None and weekly_oversold:
+    macd_strength += 1
+
+if macd_divergence and rsi_golden and not already_alerted:
+    signal = "ALERT"
+    signal_dedup = True
+elif macd_divergence:
+    signal = "WATCH"
+    signal_dedup = False
+elif macd_potential:
+    signal = "WATCH"
+    signal_dedup = False
+elif rsi_oversold_now:
+    signal = "WATCH"
+    signal_dedup = False
+else:
+    signal = "NORMAL"
+    signal_dedup = False
+
+# ==================== 状态追踪 ====================
+prev_signal = state.get("last_signal", "")
+state["last_signal"] = signal
+state["last_update"] = today_date
+state.setdefault("total_alerts", 0)
+
+changed = (prev_signal != signal and prev_signal != "")
+if signal == "ALERT" and prev_signal != "ALERT":
+    state["last_alert_date"] = today_date
+    state["last_divergence_low_idx"] = current_low_idx
+    state["total_alerts"] += 1
+
+try:
+    with open(STATE_FILE, 'w') as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+except Exception:
+    pass
+
+# ==================== DCA 救援计算 ====================
+dca_lines = []
+if cost_basis and total_shares and total_cost:
+    unrealized_pnl = (price_current - cost_basis) / cost_basis * 100
+
+    # 计算多个加仓方案
+    target_price_levels = []
+    current_buy_price = price_current
+
+    # 低于现价的几个关键位置
+    for pct_down in [0, 5, 10, 15, 20, 25, 30]:
+        target = round(price_current * (1 - pct_down / 100), 3)
+        if target not in [t for t, _ in target_price_levels]:
+            target_price_levels.append((target, pct_down))
+
+    for target_price, pct_down in target_price_levels[:5]:
+        for shares_mult in [1, 2]:
+            additional_shares = total_shares * shares_mult
+            additional_cost = additional_shares * target_price
+            new_total_cost = total_cost + additional_cost
+            new_total_shares = total_shares + additional_shares
+            new_avg = new_total_cost / new_total_shares
+            break_even_pct = (new_avg / price_current - 1) * 100
+
+            dca_lines.append({
+                "price": target_price,
+                "shares_mult": shares_mult,
+                "new_avg": new_avg,
+                "break_even": break_even_pct,
+                "desc": f"跌至 {target_price:.3f} 加仓{shares_mult}份",
+            })
+
+    # 去重只保留关键行
+    dca_display = []
+    seen_keys = set()
+    for d in dca_lines:
+        key = (d["price"], d["shares_mult"])
+        if key not in seen_keys:
+            seen_keys.add(key)
+            dca_display.append(d)
+    dca_lines = dca_display
+
+# ==================== 输出 ====================
+_stdout = sys.stdout
+_buf = StringIO()
+sys.stdout = _buf
+
+tag = "🔴" if signal == "ALERT" else ("🟡" if signal == "WATCH" else "🟢")
+change_note = " *** 状态变化 ***" if changed and signal != "NORMAL" else ""
+
+print(f"{tag} [{signal}] {today_date}{change_note}")
+print()
+
+# ---- 持仓状态 ----
+if cost_basis and total_shares:
+    pnl_pct = (price_current / cost_basis - 1) * 100
+    position_value = total_shares * price_current
+    print("┌─ 持仓状态 " + "─" * 28)
+    print(f"│  成本价:    {cost_basis:.3f}")
+    print(f"│  现价:      {price_current:.3f}")
+    print(f"│  浮动盈亏:  {pnl_pct:+.1f}%  ({position_value - total_cost:+.0f})")
+    print(f"│  持仓市值:  {position_value:,.0f}")
+    print(f"└" + "─" * 39)
+    print()
+
+# ---- 信号分析 ----
+print("┌─ 信号分析 " + "─" * 28)
+d_tag = "✅" if macd_divergence else ("⚡" if macd_potential else "⬜")
+r_tag = "✅" if rsi_golden else ("⚠️" if rsi_oversold_now else ("△" if recent_rsi_oversold else "⬜"))
+v_tag = "✅" if vol_score >= 2 else ("△" if vol_score >= 1 else ("⚠️" if vol_score < 0 else "  "))
+
+print(f"│  {d_tag} MACD底背离  (强度 {macd_strength}/10)")
+for line in macd_lines:
+    print(f"│     {line}")
+print(f"│")
+print(f"│  {r_tag} RSI14 超卖金叉")
+print(f"│     RSI14={rsi_current:.1f}  |  RSI周线={rsi_weekly:.1f}" if not np.isnan(rsi_weekly) else f"│     RSI14={rsi_current:.1f}")
+print(f"│     {rsi_text}")
+print(f"│")
+print(f"│  {v_tag} 量价")
+print(f"│     {vol_text}")
+print(f"│")
+print(f"│  综合:  {signal}" + (" (新信号)" if signal_dedup else " (持续中)" if signal == "WATCH" else ""))
+print(f"└" + "─" * 39)
+print()
+
+# ---- 救援计划 ----
+if cost_basis and total_shares and signal != "NORMAL":
+    print("┌─ 救援加仓方案 " + "─" * 24)
+    print(f"│  当前均价 {cost_basis:.3f}  现价 {price_current:.3f}")
+    print(f"│")
+    for d in dca_lines[:8]:
+        label = "├─" if d != dca_lines[-1] else "└─"
+        print(f"│  {label} {d['desc']}")
+        print(f"│  │  新均价 {d['new_avg']:.3f}  → 回本需涨至 {d['new_avg']:.3f} (距现价+{d['break_even']:.1f}%)")
+    print(f"└" + "─" * 39)
+    print()
+elif cost_basis and total_shares:
+    print(f"  [持仓中] 成本 {cost_basis:.3f}, 当前无加仓信号, 继续观望")
+    print()
+
+# ---- 操作建议 ----
+print("  【操作建议】")
+
+if signal == "ALERT":
+    print(f"  ▲ 买入: MACD底背离确认 + RSI金叉, 加仓买入")
+    if cost_basis and total_shares:
+        suggest_price = price_current
+        suggest_shares = total_shares * 1  # 加1份
+        new_avg = (total_cost + suggest_shares * suggest_price) / (total_shares + suggest_shares)
+        print(f"  建议买入: {suggest_shares:.0f} 份 @ {suggest_price:.3f}  →  新均价 {new_avg:.3f}")
+    print(f"  止损: 设置在最近波谷低点下方 3%")
+    print(f"  出场: 持仓盈利 +15% 止盈, 或触及 MA20 后回落跌破")
+    print(f"  注意: 历史共触发 {state.get('total_alerts', 0)} 次")
+
+elif signal == "WATCH":
+    if macd_potential:
+        print(f"  勿动: 底背离已露苗头但波谷未确认，等待价格止跌横盘")
+        print(f"  观察: 需连续 {SWING_WINDOW} 日不创新低 + 日线收于该低点上方，方完成波谷确认")
+        if cost_basis:
+            # 给一个预警线
+            alert_price = round(price_current * 0.95, 3)
+            new_avg_if_buy = round((total_cost + total_shares * alert_price) / (total_shares * 2), 3)
+            print(f"  预警: 若跌至 {alert_price} 可考虑提前布局, 加1份后均价约 {new_avg_if_buy}")
+    elif macd_divergence and not rsi_golden:
+        print(f"  勿动: 底背离确认但 RSI 未金叉，反弹动能不足")
+        print(f"  观察: 等待 RSI14 向上突破 {RSI_OVERSOLD} 线完成金叉确认")
+    elif rsi_oversold_now and not macd_potential:
+        print(f"  勿动: 当前仅超卖，背离尚未形成，继续观察")
+    else:
+        print(f"  勿动: 部分条件满足但不足触发，保持耐心")
+    if not rsi_golden:
+        print(f"  距 ALERT: 需 RSI14 金叉确认 → 关注 RSI14 上穿 {RSI_OVERSOLD}")
+    else:
+        print(f"  距 ALERT: 还需 MACD 底背离确认")
+
+else:
+    print(f"  不动: 既无底背离迹象也不在超卖区，日常观望即可")
+    if cost_basis and total_shares:
+        print(f"  下次检查: 明日收盘后重新运行")
+        print(f"  触发条件: RSI14 跌破 {RSI_OVERSOLD} 或形成新的底背离")
+
+print()
+print(f"  {SYMBOL} @ {price_current:.3f} (今日 {price_change:+.1f}%)")
+print(f"  自高点 {price_high:.3f} 跌 {drop_pct:.0f}%  |  距低点 {price_low:.3f} +{(price_current - price_low) / price_low * 100:.1f}%")
+print()
+
+# ---- 推送用精简摘要（供 run_true_qt.ps1 提取） ----
+if cost_basis and total_shares:
+    pos_str = f"成本{cost_basis:.3f} 浮亏{(price_current/cost_basis-1)*100:.1f}%"
+else:
+    pos_str = ""
+push_desc = {"ALERT": "底背离+RSI金叉,可加仓", "WATCH": "关注等待", "NORMAL": "观望"}.get(signal, "观望")
+print(f"[PUSH] {signal} {today_date} | {SYMBOL} {price_current:.3f} ({price_change:+.1f}%) | {pos_str} | {push_desc}"[:200])
+
+# ---- 保存结果到文件 ----
+sys.stdout = _stdout
+out_text = _buf.getvalue()
+print(out_text)
+
+try:
+    result_dir = os.path.join(SCRIPT_DIR, "结果")
+    os.makedirs(result_dir, exist_ok=True)
+    now = datetime.now()
+    fn = f"{now.year}年{now.month}月{now.day}日"
+    path = os.path.join(result_dir, fn)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(out_text)
+except Exception:
+    pass

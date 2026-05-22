@@ -1,0 +1,77 @@
+name: 513330 日报
+
+on:
+  schedule:
+    # 周一至五 15:30 北京时间 (= 07:30 UTC)
+    - cron: '30 7 * * 1-5'
+  workflow_dispatch:  # 可手动触发
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 用于提交更新回仓库
+          persist-credentials: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: 安装依赖
+        run: pip install akshare pandas numpy requests
+
+      - name: 创建推送配置
+        env:
+          SENDKEY: ${{ secrets.SENDKEY }}
+        run: echo "SENDKEY=$SENDKEY" > push_config.txt
+
+      - name: 爬取最新数据
+        run: python crawler_513330.py
+
+      - name: 运行分析
+        id: analysis
+        run: |
+          output=$(python true_qt)
+          echo "$output"
+          echo "first_line=$(echo "$output" | head -1)" >> $GITHUB_OUTPUT
+          push_line=$(echo "$output" | grep "^\[PUSH\]" | head -1 | sed 's/\[PUSH\] //')
+          echo "push_msg=$push_line" >> $GITHUB_OUTPUT
+          # 写入文件供后续步骤读取
+          echo "$output" > /tmp/true_qt_output.txt
+
+      - name: 推送通知
+        env:
+          SENDKEY: ${{ secrets.SENDKEY }}
+        run: |
+          first_line="${{ steps.analysis.outputs.first_line }}"
+          push_msg="${{ steps.analysis.outputs.push_msg }}"
+          is_alert=$(echo "$first_line" | grep -c "\[ALERT\]" || true)
+          is_changed=$(echo "$first_line" | grep -c "状态变化" || true)
+
+          # ALERT 必推, WATCH 仅在状态变化时推
+          if [ "$is_alert" -gt 0 ] || [ "$is_changed" -gt 0 ]; then
+            if [ -n "$push_msg" ] && [ -n "$SENDKEY" ]; then
+              curl -s -X POST "https://sctapi.ftqq.com/$SENDKEY.send" \
+                -H "Content-Type: application/json" \
+                -d "$(python -c "import json; print(json.dumps({'title':'513330 日报','desp':'''$push_msg'''}))")"
+              echo "推送成功"
+            fi
+          else
+            echo "信号未变化, 跳过推送"
+          fi
+
+      - name: 提交更新回仓库
+        run: |
+          git config user.name "bot"
+          git config user.email "bot@513330"
+          git add 513330_history_data.csv true_qt_state.json 结果/
+          if git diff --quiet && git diff --staged --quiet; then
+            echo "无变更, 跳过提交"
+          else
+            git commit -m "daily update $(TZ=Asia/Shanghai date '+%Y-%m-%d')"
+            git push
+            echo "已提交更新"
+          fi

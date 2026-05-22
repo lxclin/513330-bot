@@ -6,7 +6,6 @@
 import sys, os, smtplib, ssl
 from email.mime.text import MIMEText
 from email.header import Header
-from email.utils import formataddr
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "push_config.txt")
@@ -47,9 +46,9 @@ def send_email(cfg, title, body):
     else:
         use_ssl = (port == 465)
 
-    msg = MIMEText(body, "plain", "utf-8")
+    msg = MIMEText(body.encode("utf-8"), "plain", "utf-8")
     msg["Subject"] = Header(title, "utf-8")
-    msg["From"] = formataddr(("513330 日报", user))
+    msg["From"] = user
     msg["To"] = to
 
     try:

@@ -22,16 +22,10 @@ jobs:
       - name: 安装依赖
         run: pip install akshare pandas numpy
 
-      - name: 创建推送配置（SMTP）
-        run: |
-          cat > push_config.txt << EOF
-          MODE=smtp
-          SMTP_HOST=${{ secrets.SMTP_HOST }}
-          SMTP_PORT=${{ secrets.SMTP_PORT }}
-          SMTP_USER=${{ secrets.SMTP_USER }}
-          SMTP_PASS=${{ secrets.SMTP_PASS }}
-          SEND_TO=${{ secrets.SEND_TO }}
-          EOF
+      - name: 创建推送配置
+        env:
+          PUSH_CONFIG: ${{ secrets.PUSH_CONFIG }}
+        run: echo "$PUSH_CONFIG" > push_config.txt
 
       - name: 爬取最新数据
         run: python crawler_513330.py

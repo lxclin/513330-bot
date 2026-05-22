@@ -41,17 +41,9 @@ jobs:
 
       - name: 推送通知
         run: |
-          first_line="${{ steps.analysis.outputs.first_line }}"
           push_msg="${{ steps.analysis.outputs.push_msg }}"
-          is_alert=$(echo "$first_line" | grep -c "\[ALERT\]" || true)
-          is_changed=$(echo "$first_line" | grep -c "状态变化" || true)
-
-          if [ "$is_alert" -gt 0 ] || [ "$is_changed" -gt 0 ]; then
-            if [ -n "$push_msg" ]; then
-              python push_notify.py "$push_msg"
-            fi
-          else
-            echo "信号未变化, 跳过推送"
+          if [ -n "$push_msg" ]; then
+            python push_notify.py "$push_msg"
           fi
 
       - name: 提交更新回仓库

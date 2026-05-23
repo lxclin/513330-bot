@@ -1,16 +1,19 @@
 """
 推送脚本 — 支持 SMTP 邮件（QQ邮箱/163邮箱/Gmail）
 配置见 push_config.txt
+用法: python push_notify.py "消息内容"
+      python push_notify.py --file /path/to/output.txt
 """
 
-import sys, os, smtplib, ssl
+import sys, os, smtplib, ssl, argparse
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from email.header import Header
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "push_config.txt")
 
-# ==================== 读取配置 ====================
+
 def load_config():
     cfg = {}
     if os.path.exists(CONFIG_FILE):
@@ -22,34 +25,38 @@ def load_config():
                     cfg[k.strip()] = v.strip()
     return cfg
 
-# ==================== SMTP 邮件推送 ====================
+
 SMTP_DEFAULTS = {
     "smtp.qq.com":        {"port": 465, "ssl": True},
     "smtp.163.com":       {"port": 465, "ssl": True},
-    "smtp.gmail.com":     {"port": 587, "ssl": False},  # STARTTLS
+    "smtp.gmail.com":     {"port": 587, "ssl": False},
 }
 
-def send_email(cfg, title, body):
+
+def send_email(cfg, title, body_html, body_plain=""):
     host = cfg.get("SMTP_HOST", "")
     port = int(cfg.get("SMTP_PORT", 0))
     user = cfg.get("SMTP_USER", "")
     pwd  = cfg.get("SMTP_PASS", "")
-    to   = cfg.get("SEND_TO", user)            # 默认发给自己
+    to   = cfg.get("SEND_TO", user)
 
     if not host or not user or not pwd:
         return False, "SMTP 配置不完整"
 
-    # 自动补全端口和 SSL
     if host in SMTP_DEFAULTS and not port:
         port = SMTP_DEFAULTS[host]["port"]
         use_ssl = SMTP_DEFAULTS[host]["ssl"]
     else:
         use_ssl = (port == 465)
 
-    msg = MIMEText(body.encode("utf-8"), "plain", "utf-8")
+    msg = MIMEMultipart("alternative")
     msg["Subject"] = Header(title, "utf-8")
     msg["From"] = user
     msg["To"] = to
+
+    if body_plain:
+        msg.attach(MIMEText(body_plain.encode("utf-8"), "plain", "utf-8"))
+    msg.attach(MIMEText(body_html.encode("utf-8"), "html", "utf-8"))
 
     try:
         if use_ssl:
@@ -66,45 +73,87 @@ def send_email(cfg, title, body):
     except Exception as e:
         return False, str(e)
 
-# ==================== 主逻辑 ====================
-MESSAGE = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else ""
-if not MESSAGE:
-    sys.exit(0)
 
-cfg = load_config()
-mode = cfg.get("MODE", "smtp")  # smtp 或 serverchan
+def text_to_html(text):
+    """将纯文本转为 HTML，保留格式，emoji 和 box-drawing 字符"""
+    import html as _html
+    escaped = _html.escape(text)
+    return f"""\
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style="font-family: 'Consolas', 'Monaco', 'Microsoft YaHei', monospace;
+             background: #1e1e1e; color: #d4d4d4; padding: 20px; line-height: 1.6;">
+<pre style="white-space: pre-wrap; margin: 0; font-size: 14px;">
+{escaped}
+</pre>
+</body></html>"""
 
-if mode == "serverchan":
-    # 保留原 Server酱 兼容
-    sendkey = cfg.get("SENDKEY", "")
-    if not sendkey:
-        print("[推送跳过] SendKey 未配置")
-        sys.exit(0)
-    import requests
-    lines = MESSAGE.strip().split("\n")
-    title = lines[0].strip()[:80] if lines else "513330 预警"
-    body = "\n".join(lines)
-    try:
-        resp = requests.post(
-            f"https://sctapi.ftqq.com/{sendkey}.send",
-            json={"title": title, "desp": body},
-            timeout=15,
-        )
-        data = resp.json()
-        if data.get("code") == 0:
-            print("[推送成功] Server酱")
-        else:
-            print(f"[推送失败] {data.get('message', 'unknown')}")
-    except Exception as e:
-        print(f"[推送异常] {e}")
 
-else:
-    # SMTP 邮件
-    lines = MESSAGE.strip().split("\n")
-    title = lines[0].strip()[:60] if lines else "513330 日报"
-    body = MESSAGE.strip()
-    ok, err = send_email(cfg, title, body)
-    if ok:
-        print("[推送成功] 邮件")
+def text_summary(text, max_lines=3):
+    """提取摘要文本作为 plaintext fallback"""
+    lines = text.strip().split("\n")
+    return "\n".join(lines[:60])  # 保留足够多行
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("message", nargs="*", help="消息内容")
+    parser.add_argument("--file", "-f", help="从文件读取消息内容")
+    args = parser.parse_args()
+
+    if args.file:
+        with open(args.file, "r", encoding="utf-8") as f:
+            content = f.read()
     else:
-        print(f"[推送失败] {err}")
+        content = " ".join(args.message) if args.message else ""
+
+    if not content.strip():
+        sys.exit(0)
+
+    cfg = load_config()
+    mode = cfg.get("MODE", "smtp")
+
+    lines = content.strip().split("\n")
+    # 取第一行作为标题（去掉 emoji 前缀）
+    title = lines[0].strip()
+    # 去掉开头的 emoji 图标保持标题清爽
+    for prefix in ["🔴 ", "🟡 ", "🟢 "]:
+        if title.startswith(prefix):
+            title = title[len(prefix):]
+            break
+    title = title[:80]
+
+    if mode == "serverchan":
+        sendkey = cfg.get("SENDKEY", "")
+        if not sendkey:
+            print("[推送跳过] SendKey 未配置")
+            sys.exit(0)
+        import requests
+        body_plain = content.strip()
+        lines_clean = body_plain.split("\n")
+        sc_title = lines_clean[0].strip()[:80] if lines_clean else "513330 预警"
+        try:
+            resp = requests.post(
+                f"https://sctapi.ftqq.com/{sendkey}.send",
+                json={"title": sc_title, "desp": body_plain},
+                timeout=15,
+            )
+            data = resp.json()
+            if data.get("code") == 0:
+                print("[推送成功] Server酱")
+            else:
+                print(f"[推送失败] {data.get('message', 'unknown')}")
+        except Exception as e:
+            print(f"[推送异常] {e}")
+    else:
+        body_html = text_to_html(content)
+        body_plain = text_summary(content)
+        ok, err = send_email(cfg, title, body_html, body_plain)
+        if ok:
+            print("[推送成功] HTML 邮件")
+        else:
+            print(f"[推送失败] {err}")
+
+
+if __name__ == "__main__":
+    main()

@@ -37,7 +37,7 @@ jobs:
       - name: 推送通知
         run: |
           if [ -s /tmp/output.txt ]; then
-            python push_notify.py "$(cat /tmp/output.txt)"
+            python push_notify.py --file /tmp/output.txt
           fi
 
       - name: 提交更新回仓库

@@ -37,9 +37,50 @@ total_shares = state.get("total_shares", 0)
 total_cost = state.get("total_cost", 0.0)
 
 # ==================== 数据获取 ====================
-df = ak.fund_etf_hist_sina(symbol=f"sh{SYMBOL}")
-df['date'] = pd.to_datetime(df['date'])
-df = df.sort_values('date').reset_index(drop=True)
+CSV_PATH = os.path.join(SCRIPT_DIR, "513330_history_data.csv")
+
+# 读 CSV + 补实时报价
+df = pd.read_csv(CSV_PATH, parse_dates=["Date"])
+df = df.sort_values("Date").reset_index(drop=True)
+df = df.rename(columns={"Date": "date", "Open": "open", "Close": "close",
+                        "High": "high", "Low": "low", "Volume": "volume"})
+
+# ---- 实时行情（盘中补当天数据）----
+try:
+    rt_url = "http://hq.sinajs.cn/list=sh513330"
+    import requests as _req, re as _re
+    _resp = _req.get(rt_url, headers={"Referer": "https://finance.sina.com.cn"}, timeout=8)
+    _resp.encoding = "gbk"
+    _m = _re.search(r'"(.+)"', _resp.text)
+    if _m:
+        _f = _m.group(1).split(",")
+        rt_price = float(_f[3]) if len(_f) > 3 else None
+        rt_open = float(_f[1]) if len(_f) > 1 else None
+        rt_high = float(_f[4]) if len(_f) > 4 else None
+        rt_low = float(_f[5]) if len(_f) > 5 else None
+        today_ts = pd.Timestamp.now().normalize()
+        if rt_price and rt_price > 0:
+            if df['date'].max() < today_ts:
+                # 追加今天行
+                prev_close = float(df['close'].iloc[-1])
+                new_row = pd.DataFrame([{
+                    "date": today_ts,
+                    "open": rt_open if rt_open and rt_open > 0 else rt_price,
+                    "close": rt_price,
+                    "high": rt_high if rt_high and rt_high > 0 else rt_price,
+                    "low": rt_low if rt_low and rt_low > 0 else rt_price,
+                    "volume": int(df['volume'].tail(5).mean()),
+                }])
+                df = pd.concat([df, new_row], ignore_index=True)
+            elif df['date'].max() == today_ts:
+                idx = len(df) - 1
+                df.loc[idx, 'close'] = rt_price
+                if rt_high and rt_high > df.loc[idx, 'high']:
+                    df.loc[idx, 'high'] = rt_high
+                if rt_low and rt_low < df.loc[idx, 'low']:
+                    df.loc[idx, 'low'] = rt_low
+except Exception:
+    pass
 
 last_idx = len(df) - 1
 today_date = df.loc[last_idx, 'date'].strftime("%Y-%m-%d")

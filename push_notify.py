@@ -113,15 +113,24 @@ def main():
     cfg = load_config()
     mode = cfg.get("MODE", "smtp")
 
+    from datetime import datetime
     lines = content.strip().split("\n")
     # 取第一行作为标题（去掉 emoji 前缀）
     title = lines[0].strip()
-    # 去掉开头的 emoji 图标保持标题清爽
     for prefix in ["🔴 ", "🟡 ", "🟢 "]:
         if title.startswith(prefix):
             title = title[len(prefix):]
             break
-    title = title[:80]
+
+    # 根据时间添加时段标签
+    hour = datetime.now().hour
+    if hour < 12:
+        session = "[早盘]"
+    elif hour < 15:
+        session = "[午盘]"
+    else:
+        session = "[收盘]"
+    title = f"{session} {title[:70]}"
 
     if mode == "serverchan":
         sendkey = cfg.get("SENDKEY", "")

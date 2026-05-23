@@ -31,17 +31,13 @@ jobs:
       - name: 运行分析
         id: analysis
         run: |
-          output=$(python true_qt)
-          echo "$output"
-          echo "first_line=$(echo "$output" | head -1)" >> $GITHUB_OUTPUT
-          push_line=$(echo "$output" | grep "^\[PUSH\]" | head -1 | sed 's/\[PUSH\] //')
-          echo "push_msg=$push_line" >> $GITHUB_OUTPUT
+          python true_qt | tee /tmp/output.txt
+          echo "first_line=$(head -1 /tmp/output.txt)" >> $GITHUB_OUTPUT
 
       - name: 推送通知
         run: |
-          push_msg="${{ steps.analysis.outputs.push_msg }}"
-          if [ -n "$push_msg" ]; then
-            python push_notify.py "$push_msg"
+          if [ -s /tmp/output.txt ]; then
+            python push_notify.py "$(cat /tmp/output.txt)"
           fi
 
       - name: 提交更新回仓库

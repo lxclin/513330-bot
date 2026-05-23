@@ -2,7 +2,6 @@ name: 513330 日报
 
 on:
   schedule:
-    # 周一至五 15:30 北京时间 (= 07:30 UTC)
     - cron: '30 7 * * 1-5'
   workflow_dispatch:
 
